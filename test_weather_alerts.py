@@ -112,5 +112,43 @@ class SliceWindowTests(unittest.TestCase):
         self.assertEqual(out, [0.0, 1.0, 2.0, 3.0])
 
 
+class KpPayloadParseTests(unittest.TestCase):
+    """Regression tests for the Kp parser — the bug that produced 'failed to fetch data: 0'."""
+
+    def test_parses_list_of_lists(self) -> None:
+        payload = [
+            ["time_tag", "Kp", "a_running", "station_count"],
+            ["2026-05-17 00:00:00", "3.33", "12", "8"],
+            ["2026-05-17 03:00:00", "5.0", "15", "8"],
+        ]
+        rows = wa._parse_kp_payload(payload)
+        self.assertEqual(len(rows), 2)
+        self.assertAlmostEqual(rows[1][1], 5.0)
+
+    def test_parses_list_of_dicts_object_shape(self) -> None:
+        # This is the shape that triggered KeyError(0) in the original parser.
+        payload = [
+            {"time_tag": "2026-05-17T00:00:00", "kp": "3.33"},
+            {"time_tag": "2026-05-17T03:00:00", "kp": "6.0"},
+        ]
+        rows = wa._parse_kp_payload(payload)
+        self.assertEqual(len(rows), 2)
+        self.assertAlmostEqual(rows[1][1], 6.0)
+
+    def test_parses_list_of_dicts_with_predicted_kp(self) -> None:
+        payload = [
+            {"model_prediction_time": "2026-05-17 12:00:00", "predicted_kp": 4.7},
+            {"model_prediction_time": "2026-05-17 15:00:00", "predicted_kp": 7.0},
+        ]
+        rows = wa._parse_kp_payload(payload)
+        self.assertEqual(len(rows), 2)
+        self.assertAlmostEqual(rows[1][1], 7.0)
+
+    def test_empty_or_garbage_payload_returns_empty(self) -> None:
+        self.assertEqual(wa._parse_kp_payload([]), [])
+        self.assertEqual(wa._parse_kp_payload(None), [])  # type: ignore[arg-type]
+        self.assertEqual(wa._parse_kp_payload({"oops": True}), [])  # type: ignore[arg-type]
+
+
 if __name__ == "__main__":
     unittest.main()

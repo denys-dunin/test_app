@@ -19,8 +19,11 @@ import argparse
 import json
 import logging
 import os
+import platform
 import ssl
+import subprocess
 import sys
+import tempfile
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -71,30 +74,94 @@ log = logging.getLogger("weather_alerts")
 # HTTP                                                                        #
 # --------------------------------------------------------------------------- #
 
+# Common CA bundle locations across Linux distros + macOS.
+_SYSTEM_CA_CANDIDATES: tuple[str, ...] = (
+    "/etc/ssl/cert.pem",                                  # macOS, FreeBSD, Alpine
+    "/etc/ssl/certs/ca-certificates.crt",                 # Debian, Ubuntu
+    "/etc/pki/tls/certs/ca-bundle.crt",                   # RHEL, CentOS, Fedora
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",  # RHEL 8+
+    "/etc/ssl/ca-bundle.pem",                             # openSUSE
+)
+
+
+def _macos_keychain_bundle() -> str | None:
+    """
+    Last-resort CA discovery on macOS: ask the system keychain for every
+    trusted root cert and write it to a temp PEM. This is what
+    `Install Certificates.command` does under the hood for python.org Python.
+    """
+    if platform.system() != "Darwin":
+        return None
+    keychains = (
+        "/System/Library/Keychains/SystemRootCertificates.keychain",
+        "/Library/Keychains/System.keychain",
+    )
+    parts: list[str] = []
+    for kc in keychains:
+        if not os.path.exists(kc):
+            continue
+        try:
+            out = subprocess.run(
+                ["security", "find-certificate", "-a", "-p", kc],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if out.returncode == 0 and out.stdout:
+            parts.append(out.stdout)
+    if not parts:
+        return None
+    fd, path = tempfile.mkstemp(prefix="weather-alerts-ca-", suffix=".pem")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(parts))
+    except OSError:
+        return None
+    return path
+
+
 def _build_ssl_context() -> ssl.SSLContext:
     """
     Build an SSL context that actually verifies certs across environments.
 
-    On macOS, Python installed via the python.org installer (and some other
-    distributions) ships without OS-level trust roots, so the stdlib's default
-    context cannot verify any HTTPS server out of the box — that produces:
+    On macOS, Python installed via the python.org installer ships without
+    OS-level trust roots, so the stdlib's default context can't verify any
+    HTTPS server out of the box — that produces:
 
         SSL: CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate
 
-    The fix is to point OpenSSL at a CA bundle. We try, in order:
+    Resolution order:
       1. SSL_CERT_FILE env var (if set and exists)
-      2. The `certifi` package's bundle (optional dep — usually already
-         present because lots of libraries pull it in)
-      3. The stdlib default (works on Linux distros with /etc/ssl/certs)
+      2. The `certifi` package's bundle (optional dep)
+      3. A well-known system CA bundle path
+      4. (macOS only) certs extracted from the system keychain
+      5. Stdlib default — usually works on properly configured Linux
     """
     cafile = os.environ.get("SSL_CERT_FILE")
     if cafile and os.path.isfile(cafile):
+        log.debug("ssl: using SSL_CERT_FILE=%s", cafile)
         return ssl.create_default_context(cafile=cafile)
+
     try:
         import certifi  # type: ignore
-        return ssl.create_default_context(cafile=certifi.where())
+        path = certifi.where()
+        log.debug("ssl: using certifi bundle at %s", path)
+        return ssl.create_default_context(cafile=path)
     except Exception:
-        return ssl.create_default_context()
+        pass
+
+    for path in _SYSTEM_CA_CANDIDATES:
+        if os.path.isfile(path):
+            log.debug("ssl: using system CA bundle at %s", path)
+            return ssl.create_default_context(cafile=path)
+
+    keychain_bundle = _macos_keychain_bundle()
+    if keychain_bundle:
+        log.debug("ssl: using macOS keychain export at %s", keychain_bundle)
+        return ssl.create_default_context(cafile=keychain_bundle)
+
+    log.debug("ssl: using stdlib default context (no explicit CA bundle found)")
+    return ssl.create_default_context()
 
 
 _SSL_CONTEXT: ssl.SSLContext | None = None
@@ -134,14 +201,17 @@ def resolve_location(spec: Any) -> Location:
 
     if isinstance(spec, str) and spec.strip().lower() == "auto":
         data = http_get_json("https://ipapi.co/json/")
+        if not isinstance(data, dict) or data.get("error"):
+            reason = data.get("reason") if isinstance(data, dict) else "no response"
+            raise RuntimeError(f"IP geolocation failed: {reason}")
+        lat = data.get("latitude")
+        lon = data.get("longitude")
+        if lat is None or lon is None:
+            raise RuntimeError("IP geolocation response missing latitude/longitude")
         city = data.get("city") or ""
         country = data.get("country_name") or data.get("country") or ""
         label = ", ".join(p for p in (city, country) if p) or "your location"
-        return Location(
-            lat=float(data["latitude"]),
-            lon=float(data["longitude"]),
-            label=label,
-        )
+        return Location(lat=float(lat), lon=float(lon), label=label)
 
     if isinstance(spec, str):
         # Geocode a city name via Open-Meteo
@@ -253,40 +323,115 @@ class KpForecast:
 
 def fetch_kp() -> KpForecast:
     """
-    NOAA SWPC publishes a 3-day Kp forecast as a small JSON 2-D array. The first
-    row is the header, e.g. ["time_tag","kp","observed","noaa_scale"].
+    Fetch upcoming planetary Kp values from NOAA SWPC.
+
+    SWPC has changed the response shape of this feed at least once in the
+    wild: it has been served as both a list-of-lists (first row a header)
+    and a list-of-objects. We tolerate either. We also try the forecast
+    endpoint first and fall back to the observed-Kp feed so we still get
+    *some* signal if the forecast feed is unavailable.
     """
-    data = http_get_json("https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json")
-    if not isinstance(data, list) or len(data) < 2:
-        return KpForecast()
-    header = [str(h).lower() for h in data[0]]
-    try:
-        time_idx = header.index("time_tag")
-    except ValueError:
-        time_idx = 0
-    try:
-        kp_idx = header.index("kp")
-    except ValueError:
-        kp_idx = 1
+    urls = (
+        "https://services.swpc.noaa.gov/products/noaa-planetary-k-index-forecast.json",
+        "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json",
+    )
+    last_err: Exception | None = None
+    for url in urls:
+        try:
+            data = http_get_json(url)
+        except Exception as exc:
+            last_err = exc
+            continue
+        rows = _parse_kp_payload(data)
+        if rows:
+            return KpForecast(rows=rows)
+    if last_err is not None:
+        log.warning("Kp fetch failed: %s", last_err)
+    return KpForecast()
+
+
+_KP_TIME_KEYS: tuple[str, ...] = (
+    "time_tag", "model_prediction_time", "valid_time", "prediction_time", "time"
+)
+_KP_VALUE_KEYS: tuple[str, ...] = (
+    "kp", "predicted_kp", "kp_index", "estimated_kp"
+)
+
+
+def _parse_kp_payload(data: Any) -> list[tuple[datetime, float]]:
+    """Parse NOAA's Kp feed. Tolerates both list-of-lists and list-of-dicts."""
+    if not isinstance(data, list) or not data:
+        return []
 
     rows: list[tuple[datetime, float]] = []
-    for row in data[1:]:
-        try:
-            ts = row[time_idx]
-            kp = float(row[kp_idx])
-        except (IndexError, ValueError, TypeError):
-            continue
-        # SWPC stamps are like "2024-01-01 00:00:00" in UTC.
-        try:
-            dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-        except ValueError:
-            try:
-                dt = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
-            except ValueError:
+    first = data[0]
+
+    if isinstance(first, dict):
+        # List-of-objects shape.
+        for row in data:
+            if not isinstance(row, dict):
                 continue
-        rows.append((dt, kp))
-    rows.sort()
-    return KpForecast(rows=rows)
+            ts = _first_present(row, _KP_TIME_KEYS)
+            kp = _first_present(row, _KP_VALUE_KEYS)
+            dt = _parse_kp_timestamp(ts)
+            try:
+                kpv = float(kp) if kp is not None else None
+            except (ValueError, TypeError):
+                kpv = None
+            if dt is not None and kpv is not None:
+                rows.append((dt, kpv))
+    else:
+        # 2-D array shape: first row is a header.
+        header = [str(h).lower() for h in first] if hasattr(first, "__iter__") else []
+        time_idx = header.index("time_tag") if "time_tag" in header else 0
+        # The "kp" column may also appear as "kp_index" depending on the feed.
+        if "kp" in header:
+            kp_idx = header.index("kp")
+        elif "kp_index" in header:
+            kp_idx = header.index("kp_index")
+        else:
+            kp_idx = 1
+
+        for row in data[1:]:
+            if isinstance(row, dict) or not hasattr(row, "__getitem__"):
+                continue
+            try:
+                ts = row[time_idx]
+                kp = float(row[kp_idx])
+            except (IndexError, ValueError, TypeError):
+                continue
+            dt = _parse_kp_timestamp(ts)
+            if dt is not None:
+                rows.append((dt, kp))
+
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+def _first_present(d: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    """Return d[k] for the first key in `keys` that's present and non-empty."""
+    for k in keys:
+        if k in d and d[k] not in (None, ""):
+            return d[k]
+    return None
+
+
+def _parse_kp_timestamp(ts: Any) -> datetime | None:
+    """Parse the assortment of timestamp shapes SWPC has served over the years."""
+    if not isinstance(ts, str) or not ts:
+        return None
+    s = ts.strip()
+    # Try the most common literal formats first.
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    # ISO 8601 with optional Z or offset.
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except (ValueError, AttributeError):
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -442,6 +587,26 @@ def main(argv: list[str] | None = None) -> int:
         loc = resolve_location(cfg["location"])
         snap = fetch_weather(loc, cfg.get("timezone"))
         kp = fetch_kp()
+    except urllib.error.URLError as exc:
+        # Surface a much more actionable message for the common SSL failure
+        # rather than just dumping the raw OpenSSL error.
+        reason = getattr(exc, "reason", exc)
+        msg = str(reason)
+        if "CERTIFICATE_VERIFY_FAILED" in msg or isinstance(reason, ssl.SSLCertVerificationError):
+            log.error(
+                "TLS certificate verification failed.\n"
+                "  Your Python install lacks trusted root certificates.\n"
+                "  Quick fixes (pick one):\n"
+                "    1.  pip install certifi\n"
+                "    2.  /Applications/Python\\ 3.x/Install\\ Certificates.command   "
+                "(python.org Python on macOS — adjust 3.x to your version)\n"
+                "    3.  SSL_CERT_FILE=/etc/ssl/cert.pem python3 weather_alerts.py\n"
+                "  Underlying error: %s",
+                msg,
+            )
+        else:
+            log.error("network error: %s", msg)
+        return 2
     except Exception as exc:
         log.error("failed to fetch data: %s", exc)
         return 2
