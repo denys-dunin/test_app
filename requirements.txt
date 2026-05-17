@@ -1,0 +1,9 @@
+# Optional but recommended on macOS — provides Mozilla's CA bundle so the
+# script can verify TLS certs without OS-level trust roots. Fixes the
+# "CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate" error
+# you get with the python.org installer.
+certifi>=2024.2.2
+
+# Cross-platform desktop notifications (macOS, Linux, Windows).
+# Drop this line if you only need stdout output.
+plyer>=2.1.0

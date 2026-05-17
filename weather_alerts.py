@@ -18,6 +18,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import ssl
 import sys
 import urllib.parse
 import urllib.request
@@ -69,10 +71,42 @@ log = logging.getLogger("weather_alerts")
 # HTTP                                                                        #
 # --------------------------------------------------------------------------- #
 
+def _build_ssl_context() -> ssl.SSLContext:
+    """
+    Build an SSL context that actually verifies certs across environments.
+
+    On macOS, Python installed via the python.org installer (and some other
+    distributions) ships without OS-level trust roots, so the stdlib's default
+    context cannot verify any HTTPS server out of the box — that produces:
+
+        SSL: CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate
+
+    The fix is to point OpenSSL at a CA bundle. We try, in order:
+      1. SSL_CERT_FILE env var (if set and exists)
+      2. The `certifi` package's bundle (optional dep — usually already
+         present because lots of libraries pull it in)
+      3. The stdlib default (works on Linux distros with /etc/ssl/certs)
+    """
+    cafile = os.environ.get("SSL_CERT_FILE")
+    if cafile and os.path.isfile(cafile):
+        return ssl.create_default_context(cafile=cafile)
+    try:
+        import certifi  # type: ignore
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+_SSL_CONTEXT: ssl.SSLContext | None = None
+
+
 def http_get_json(url: str) -> Any:
     """GET a URL and return parsed JSON. Raises on non-2xx."""
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is None:
+        _SSL_CONTEXT = _build_ssl_context()
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S, context=_SSL_CONTEXT) as resp:
         data = resp.read()
     return json.loads(data.decode("utf-8"))
 
