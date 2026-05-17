@@ -1,0 +1,16 @@
+{
+  "location": "auto",
+  "thresholds": {
+    "temp_low_c": 0.0,
+    "temp_high_c": 28.0,
+    "kp_index": 5.0,
+    "precip_prob_pct": 50,
+    "precip_mm": 0.2,
+    "wind_ms": 10.0
+  },
+  "precip_lookahead_h": 6,
+  "wind_lookahead_h": 6,
+  "kp_lookahead_h": 24,
+  "timezone": null,
+  "desktop_notification": true
+}
